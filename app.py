@@ -1,8 +1,10 @@
 import streamlit as st
 import time
 import pandas as pd
+import os
+from datetime import datetime
 from src import extract, transform, load
-from config import PLANILHAS_ONLINE, PLANILHAS_UPLOAD, HISTORICO_DIR
+from config import PLANILHAS_UPLOAD, PLANILHAS_REDE, HISTORICO_DIR
 
 # Configuração da Página
 st.set_page_config(page_title="Data Sync | KaBuM!", page_icon="🧡", layout="wide")
@@ -19,112 +21,167 @@ with st.sidebar:
     st.write("---")
     st.write("👤 **Autor:** Daniel Alves")
     st.write("⛱️ **Status:** Modo Férias Ativo")
+
+    # Informações das bases históricas
     st.write("---")
-
-    # Informações sobre bases históricas
-    st.write("📁 **Bases Históricas**")
-    arquivos_historico = sorted(HISTORICO_DIR.glob("*.csv"))
-    if arquivos_historico:
-        for arq in arquivos_historico:
-            tamanho_kb = arq.stat().st_size / 1024
-            data_mod = pd.Timestamp(arq.stat().st_mtime, unit="s").strftime("%d/%m/%Y %H:%M")
-            st.caption(f"📄 `{arq.name}`\n{tamanho_kb:.1f} KB · {data_mod}")
+    st.subheader("📁 Bases Históricas")
+    if HISTORICO_DIR.exists():
+        arquivos = list(HISTORICO_DIR.glob("*.csv"))
+        if arquivos:
+            for arq in sorted(arquivos):
+                tamanho_mb = arq.stat().st_size / (1024 * 1024)
+                data_mod = datetime.fromtimestamp(arq.stat().st_mtime).strftime("%d/%m/%Y %H:%M")
+                st.caption(f"📄 **{arq.name}**")
+                st.caption(f"   {tamanho_mb:.2f} MB | Atualizado: {data_mod}")
+        else:
+            st.caption("Nenhuma base histórica ainda.")
     else:
-        st.caption("Nenhuma base histórica encontrada.")
+        st.caption("Pasta de histórico não encontrada.")
 
-# ─── ETAPA 1: Uploads obrigatórios ───────────────────────────────────────────
-st.subheader("📤 ETAPA 1: Upload das planilhas")
+# ============================================================
+# ÁREA DE UPLOAD DE ARQUIVOS
+# ============================================================
+st.subheader("📤 Upload de Planilhas (CSV ou XLSX)")
+st.caption("Faça o download das planilhas do Google Sheets e arraste aqui.")
 
 uploads = {}
-for planilha in PLANILHAS_UPLOAD:
-    arquivo = st.file_uploader(
-        f"📤 Upload CSV: {planilha['nome']}",
-        type=["csv"],
-        key=f"upload_{planilha['nome']}",
-    )
-    uploads[planilha["nome"]] = arquivo
+cols = st.columns(len(PLANILHAS_UPLOAD))
+for i, planilha in enumerate(PLANILHAS_UPLOAD):
+    with cols[i]:
+        arquivo = st.file_uploader(
+            f"📄 {planilha['nome']}",
+            type=["csv", "xlsx", "xls"],
+            key=f"upload_{i}",
+        )
+        uploads[planilha["nome"]] = arquivo
 
 st.markdown("---")
 
-# ─── Botão de Execução ────────────────────────────────────────────────────────
-if st.button("🔄 Iniciar Processamento"):
+# ============================================================
+# ÁREA DE PLANILHAS DA REDE (automáticas)
+# ============================================================
+st.subheader("📂 Planilhas da Rede Interna (automático)")
+for planilha in PLANILHAS_REDE:
+    caminho_completo = os.path.join(planilha["caminho"], planilha["arquivo"])
+    existe = os.path.exists(caminho_completo)
+    icone = "🟢" if existe else "🔴"
+    st.caption(f"{icone} **{planilha['nome']}**: `{planilha['arquivo']}`")
 
-    # Verifica se todos os uploads obrigatórios foram feitos
+st.markdown("---")
+
+# ============================================================
+# BOTÃO DE PROCESSAMENTO
+# ============================================================
+if st.button("🔄 Iniciar Processamento das Bases", type="primary"):
+
+    # Verificar uploads obrigatórios
     uploads_faltando = [p["nome"] for p in PLANILHAS_UPLOAD if uploads.get(p["nome"]) is None]
     if uploads_faltando:
-        for nome_faltando in uploads_faltando:
-            st.warning(f"⚠️ Por favor, faça o upload do CSV: **{nome_faltando}**")
+        st.warning(f"⚠️ Faça o upload das planilhas: {', '.join(uploads_faltando)}")
         st.stop()
 
     progresso = st.progress(0)
     status = st.empty()
-    detalhes = st.expander("Logs de Processamento", expanded=True)
+    detalhes = st.expander("📋 Logs de Processamento", expanded=True)
 
     try:
         lista_bases = []
+        total_planilhas = len(PLANILHAS_UPLOAD) + len(PLANILHAS_REDE)
+        planilhas_processadas = 0
 
-        # ── ETAPA 1 – EXTRAÇÃO ────────────────────────────────────────────────
-        status.info("📥 Passo 1/3: Extraindo dados...")
+        # ────────────────────────────────────────────
+        # ETAPA 1: LEITURA DOS UPLOADS (CSV/XLSX)
+        # ────────────────────────────────────────────
+        status.info("📥 Passo 1/4: Lendo arquivos de upload...")
 
-        # 1a. Planilhas de upload manual
         for planilha in PLANILHAS_UPLOAD:
             nome = planilha["nome"]
-            arquivo = uploads[nome]
-            detalhes.write(f"Lendo CSV enviado: **{nome}**...")
-            try:
-                df = pd.read_csv(arquivo, encoding="utf-8")
-            except UnicodeDecodeError:
-                arquivo.seek(0)
-                df = pd.read_csv(arquivo, encoding="latin-1")
-            detalhes.write(f"✔️ {nome}: **{len(df)}** registros lidos do upload.")
-            lista_bases.append((planilha, df))
+            detalhes.write(f"📄 Lendo upload: **{nome}**...")
 
-        # 1b. Planilhas online
-        for planilha in PLANILHAS_ONLINE:
+            arquivo = uploads[nome]
+            df = extract.ler_arquivo_upload(arquivo)
+            detalhes.write(f"   ✔️ Arquivo lido: **{len(df)}** registros")
+
+            # Carga incremental
+            chave = planilha["chave_unica"]
+            if chave:
+                df_atualizado, qtd_novos, qtd_total = extract.carga_incremental(df, nome, chave)
+                detalhes.write(f"   📊 **{qtd_novos}** registros novos adicionados (base total: **{qtd_total}**)")
+                lista_bases.append(df_atualizado)
+            else:
+                lista_bases.append(df)
+
+            planilhas_processadas += 1
+            progresso.progress(int(planilhas_processadas / total_planilhas * 25))
+
+        # ────────────────────────────────────────────
+        # ETAPA 2: LEITURA DA REDE INTERNA
+        # ────────────────────────────────────────────
+        status.info("📂 Passo 2/4: Lendo planilhas da rede interna...")
+
+        for planilha in PLANILHAS_REDE:
             nome = planilha["nome"]
-            detalhes.write(f"Lendo planilha online: **{nome}**...")
-            df = extract.extrair_google_sheets(planilha)
-            detalhes.write(f"✔️ {nome}: **{len(df)}** registros lidos.")
-            lista_bases.append((planilha, df))
-            time.sleep(0.3)
+            somente_historico = planilha.get("somente_historico", False)
+
+            # Se é somente histórico, verifica se já foi carregado antes
+            if somente_historico:
+                df_hist = extract.carregar_base_historica(nome)
+                if not df_hist.empty:
+                    detalhes.write(f"📂 **{nome}**: já carregado anteriormente ({len(df_hist)} registros). Pulando.")
+                    lista_bases.append(df_hist)
+                    planilhas_processadas += 1
+                    progresso.progress(int(planilhas_processadas / total_planilhas * 25))
+                    continue
+
+            detalhes.write(f"📂 Lendo da rede: **{nome}**...")
+
+            try:
+                df = extract.ler_arquivo_rede(planilha)
+                filtros_aplicados = planilha.get("filtros", {})
+                filtros_str = ", ".join(f"{k}={v}" for k, v in filtros_aplicados.items()) if filtros_aplicados else "nenhum"
+                detalhes.write(f"   ✔️ Arquivo lido: **{len(df)}** registros (filtros aplicados: {filtros_str})")
+
+                # Carga incremental
+                chave = planilha.get("chave_unica", [])
+                if chave:
+                    df_atualizado, qtd_novos, qtd_total = extract.carga_incremental(df, nome, chave)
+                    detalhes.write(f"   📊 **{qtd_novos}** registros novos (base total: **{qtd_total}**)")
+                    lista_bases.append(df_atualizado)
+                else:
+                    lista_bases.append(df)
+
+            except FileNotFoundError as e:
+                detalhes.warning(f"   ⚠️ {nome}: Arquivo não encontrado na rede. {str(e)}")
+                # Tenta carregar do histórico
+                df_hist = extract.carregar_base_historica(nome)
+                if not df_hist.empty:
+                    detalhes.write(f"   📂 Usando base histórica: **{len(df_hist)}** registros")
+                    lista_bases.append(df_hist)
+                else:
+                    detalhes.error(f"   ❌ Sem dados para {nome}. Nenhum histórico encontrado.")
+
+            planilhas_processadas += 1
+            progresso.progress(int(planilhas_processadas / total_planilhas * 25))
 
         progresso.progress(33)
 
-        # ── ETAPA 1.5 – CARGA INCREMENTAL ────────────────────────────────────
-        status.info("🔄 Passo 1.5/3: Aplicando carga incremental...")
-        dfs_para_consolidar = []
+        # ────────────────────────────────────────────
+        # ETAPA 3: TRANSFORMAÇÃO
+        # ────────────────────────────────────────────
+        status.info("⚙️ Passo 3/4: Consolidando e processando dados...")
+        df_final = transform.processar_e_consolidar(lista_bases)
+        detalhes.success(f"✅ Consolidação concluída! **{len(df_final)}** registros totais.")
 
-        for planilha, df in lista_bases:
-            nome = planilha["nome"]
-            chave_unica = planilha.get("chave_unica", [])
-
-            if chave_unica:
-                df_atualizado, qtd_novos = extract.carga_incremental(
-                    df, nome, chave_unica
-                )
-                detalhes.write(
-                    f"📊 {nome}: **{qtd_novos}** registros novos adicionados "
-                    f"(base total: **{len(df_atualizado)}** registros)"
-                )
-                dfs_para_consolidar.append(df_atualizado)
-            else:
-                detalhes.write(f"📋 {nome}: usando dados como vieram ({len(df)} registros).")
-                dfs_para_consolidar.append(df)
-
-        progresso.progress(50)
-
-        # ── ETAPA 2 – TRANSFORMAÇÃO ───────────────────────────────────────────
-        status.info("⚙️ Passo 2/3: Consolidando e processando cálculos...")
-        df_final = transform.processar_e_consolidar(dfs_para_consolidar)
-        detalhes.success(f"Consolidação concluída! {len(df_final)} registros encontrados.")
-        st.write("### Pré-visualização dos Dados Consolidados")
-        st.dataframe(df_final.head(10), use_container_width=True)
+        st.write("### 📊 Pré-visualização dos Dados Consolidados")
+        st.dataframe(df_final.head(15), use_container_width=True)
         progresso.progress(66)
 
-        # ── ETAPA 3 – CARGA ───────────────────────────────────────────────────
-        status.info("📤 Passo 3/3: Criando backup e enviando para o WebApp...")
+        # ────────────────────────────────────────────
+        # ETAPA 4: CARGA (Backup + WebApp)
+        # ────────────────────────────────────────────
+        status.info("📤 Passo 4/4: Criando backup e enviando para o WebApp...")
         dados_json, nome_arquivo = load.gerar_backup_local(df_final)
-        detalhes.write(f"Arquivo de backup criado: `{nome_arquivo}`")
+        detalhes.write(f"💾 Backup criado: `{nome_arquivo}`")
 
         codigo_http, resposta_txt = load.enviar_webapp(dados_json)
 
@@ -134,7 +191,8 @@ if st.button("🔄 Iniciar Processamento"):
             st.balloons()
             st.success(f"O WebApp recebeu os dados. Resposta: {resposta_txt}")
         else:
-            st.error(f"❌ Falha no envio para o WebApp. Erro HTTP: {codigo_http}")
+            progresso.progress(100)
+            st.warning(f"⚠️ Backup local salvo com sucesso! Envio para WebApp falhou (HTTP {codigo_http}).")
             st.code(resposta_txt)
 
     except Exception as e:
@@ -142,5 +200,5 @@ if st.button("🔄 Iniciar Processamento"):
         status.error("O processamento foi interrompido.")
 
 else:
-    st.write("Faça o upload dos arquivos necessários e clique no botão acima para iniciar a rotina de dados.")
+    st.info("👆 Faça o upload dos arquivos e clique no botão para iniciar.")
 

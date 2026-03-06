@@ -1,211 +1,181 @@
-import re
-import shutil
 import pandas as pd
-from io import StringIO
+import shutil
+import re
+from pathlib import Path
 from datetime import datetime
 from config import RAW_DIR, HISTORICO_DIR, BACKUP_DIR
 
-# URL base para exportar uma aba do Google Sheets como CSV
-_EXPORT_URL = (
-    "https://docs.google.com/spreadsheets/d/{spreadsheet_id}"
-    "/export?format=csv&gid={gid}"
-)
 
-
-def extrair_google_sheets(planilha_info):
-    """
-    Lê uma aba do Google Sheets via export CSV público.
-
-    Parâmetros
-    ----------
-    planilha_info : dict
-        Dicionário com as chaves:
-        - "nome"            : str  → Nome amigável (para logs)
-        - "spreadsheet_id"  : str  → ID da planilha
-        - "gid"             : str  → ID da aba
-
-    Retorna
-    -------
-    pd.DataFrame com os dados da aba.
-
-    Requisitos
-    ----------
-    A planilha precisa estar compartilhada como:
-    - "Qualquer pessoa com o link pode ver"  (ou)
-    - "Qualquer pessoa na organização com o link"
-    """
-    nome = planilha_info["nome"]
-    url = _EXPORT_URL.format(
-        spreadsheet_id=planilha_info["spreadsheet_id"],
-        gid=planilha_info["gid"],
-    )
-
-    try:
-        df = pd.read_csv(url)
-
-        if df.empty:
-            raise ValueError(f"A planilha '{nome}' retornou vazia.")
-
-        return df
-
-    except Exception as e:
-        raise Exception(
-            f"Erro ao acessar a planilha '{nome}': {str(e)}\n"
-            f"Verifique se a planilha está compartilhada com 'Qualquer pessoa com o link'."
-        )
-
-
-def extrair_csv_local(nome_arquivo):
-    """
-    Lê um arquivo CSV exportado de um sistema interno.
-
-    O arquivo deve estar na pasta data/raw/.
-
-    Parâmetros
-    ----------
-    nome_arquivo : str
-        Nome do arquivo CSV (ex: "relatorio_sistema.csv")
-
-    Retorna
-    -------
-    pd.DataFrame com os dados do CSV.
-    """
-    caminho = RAW_DIR / nome_arquivo
-
-    if not caminho.exists():
-        raise FileNotFoundError(
-            f"Arquivo '{nome_arquivo}' não encontrado em data/raw/.\n"
-            f"Caminho esperado: {caminho}"
-        )
-
-    try:
-        df = pd.read_csv(caminho, encoding="utf-8")
-        return df
-    except UnicodeDecodeError:
-        df = pd.read_csv(caminho, encoding="latin-1")
-        return df
-
-
-# ============================================================
-# Funções de Carga Incremental
-# ============================================================
-
-def _sanitizar_nome(nome_planilha):
+def _sanitizar_nome(nome):
     """Remove caracteres especiais e substitui espaços por underscore."""
-    nome = re.sub(r"[^\w\s]", "", nome_planilha)
-    nome = re.sub(r"\s+", "_", nome.strip())
-    return nome
+    nome = re.sub(r'[^\w\s-]', '', nome)
+    nome = re.sub(r'\s+', '_', nome)
+    return nome.strip('_')
+
+
+def _caminho_historico(nome_planilha):
+    """Retorna o caminho do arquivo histórico para uma planilha."""
+    nome_arquivo = _sanitizar_nome(nome_planilha) + ".csv"
+    return HISTORICO_DIR / nome_arquivo
 
 
 def carregar_base_historica(nome_planilha):
     """
-    Carrega o CSV histórico de data/historico/{nome_planilha}.csv.
-
-    Retorna DataFrame vazio se o arquivo não existir.
+    Carrega a base histórica de uma planilha.
+    Retorna DataFrame vazio se não existir.
     """
-    nome_arquivo = _sanitizar_nome(nome_planilha) + ".csv"
-    caminho = HISTORICO_DIR / nome_arquivo
-
+    caminho = _caminho_historico(nome_planilha)
     if not caminho.exists():
         return pd.DataFrame()
 
     try:
-        return pd.read_csv(caminho, encoding="utf-8")
+        df = pd.read_csv(caminho, encoding="utf-8", dtype=str)
+        return df
     except UnicodeDecodeError:
-        return pd.read_csv(caminho, encoding="latin-1")
+        df = pd.read_csv(caminho, encoding="latin-1", dtype=str)
+        return df
 
 
 def salvar_base_historica(df, nome_planilha):
     """
-    Salva o DataFrame atualizado em data/historico/{nome_planilha}.csv.
-    Faz backup da versão anterior em data/backups/ com timestamp.
+    Salva a base histórica atualizada.
+    Faz backup do arquivo anterior antes de sobrescrever.
     """
-    nome_arquivo = _sanitizar_nome(nome_planilha) + ".csv"
-    caminho = HISTORICO_DIR / nome_arquivo
+    caminho = _caminho_historico(nome_planilha)
 
-    # Backup da versão anterior antes de sobrescrever
+    # Backup do arquivo anterior (se existir)
     if caminho.exists():
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        nome_backup = f"{_sanitizar_nome(nome_planilha)}_{timestamp}.csv"
-        shutil.copy2(caminho, BACKUP_DIR / nome_backup)
+        nome_backup = f"{_sanitizar_nome(nome_planilha)}_backup_{timestamp}.csv"
+        caminho_backup = BACKUP_DIR / nome_backup
+        shutil.copy2(caminho, caminho_backup)
 
     df.to_csv(caminho, index=False, encoding="utf-8")
 
 
 def carga_incremental(df_novo, nome_planilha, colunas_chave):
     """
-    Realiza a carga incremental comparando df_novo com a base histórica.
+    Compara dados novos com a base histórica e adiciona apenas registros novos.
 
-    Parâmetros
-    ----------
-    df_novo : pd.DataFrame
-        Dados novos (vindos do upload ou leitura online).
-    nome_planilha : str
-        Nome amigável da planilha (usado para nomear o arquivo histórico).
-    colunas_chave : list[str]
-        Colunas que formam a chave única para identificar registros duplicados.
-
-    Retorna
-    -------
-    tuple(pd.DataFrame, int)
-        DataFrame atualizado (base histórica + novos registros) e
-        quantidade de novos registros adicionados.
-
-    Raises
-    ------
-    ValueError
-        Se alguma coluna da chave_unica não existir em df_novo.
+    Retorna: (df_atualizado, qtd_novos, qtd_total)
     """
-    # Validar colunas-chave
-    colunas_ausentes = [c for c in colunas_chave if c not in df_novo.columns]
-    if colunas_ausentes:
+    # Validar se as colunas chave existem no DataFrame
+    colunas_faltando = [col for col in colunas_chave if col not in df_novo.columns]
+    if colunas_faltando:
         raise ValueError(
-            f"Planilha '{nome_planilha}': as seguintes colunas da chave única "
-            f"não foram encontradas no DataFrame: {colunas_ausentes}.\n"
+            f"Colunas chave não encontradas no arquivo: {colunas_faltando}\n"
             f"Colunas disponíveis: {list(df_novo.columns)}"
         )
 
-    base_historica = carregar_base_historica(nome_planilha)
+    # Converter tudo para string para comparação
+    df_novo_str = df_novo.copy()
+    for col in colunas_chave:
+        df_novo_str[col] = df_novo_str[col].astype(str).str.strip()
 
-    # Primeira execução: salva tudo e retorna
-    if base_historica.empty:
+    # Carregar base histórica
+    df_historico = carregar_base_historica(nome_planilha)
+
+    if df_historico.empty:
+        # Primeira execução - salva tudo
         salvar_base_historica(df_novo, nome_planilha)
-        return df_novo, len(df_novo)
+        return df_novo, len(df_novo), len(df_novo)
 
-    # Cria chave composta em ambos os DataFrames.
-    # Nota: valores NaN são convertidos para a string 'nan'; se as colunas-chave
-    # puderem conter nulos, considere tratar esses valores antes de chamar esta função.
-    def _chave(df):
-        return df[colunas_chave].astype(str).agg("|".join, axis=1)
+    # Converter colunas chave do histórico para string
+    for col in colunas_chave:
+        if col in df_historico.columns:
+            df_historico[col] = df_historico[col].astype(str).str.strip()
 
-    df_novo = df_novo.copy()
-    base_historica = base_historica.copy()
-
-    df_novo["_chave_composta"] = _chave(df_novo)
-
-    # Garante que a base histórica também tenha as colunas-chave
-    colunas_ausentes_hist = [c for c in colunas_chave if c not in base_historica.columns]
-    if colunas_ausentes_hist:
-        # Base histórica não tem as colunas-chave: trata como vazia
-        salvar_base_historica(df_novo.drop(columns=["_chave_composta"]), nome_planilha)
-        return df_novo.drop(columns=["_chave_composta"]), len(df_novo)
-
-    base_historica["_chave_composta"] = _chave(base_historica)
-
-    # Identifica registros novos
-    chaves_existentes = set(base_historica["_chave_composta"])
-    mascara_novos = ~df_novo["_chave_composta"].isin(chaves_existentes)
-    df_novos_registros = df_novo[mascara_novos]
-    qtd_novos = len(df_novos_registros)
-
-    # Concatena novos registros com a base histórica
-    df_atualizado = pd.concat(
-        [base_historica, df_novos_registros], ignore_index=True
+    # Criar chave composta para comparação
+    df_novo_str["_chave_composta"] = df_novo_str[colunas_chave].apply(
+        lambda row: "||".join(row.values), axis=1
+    )
+    df_historico["_chave_composta"] = df_historico[colunas_chave].apply(
+        lambda row: "||".join(row.values), axis=1
     )
 
-    # Remove coluna auxiliar
-    df_atualizado = df_atualizado.drop(columns=["_chave_composta"])
+    # Identificar registros novos
+    chaves_existentes = set(df_historico["_chave_composta"])
+    mascara_novos = ~df_novo_str["_chave_composta"].isin(chaves_existentes)
+    df_novos_registros = df_novo[mascara_novos].copy()
 
-    salvar_base_historica(df_atualizado, nome_planilha)
+    qtd_novos = len(df_novos_registros)
 
-    return df_atualizado, qtd_novos
+    if qtd_novos > 0:
+        # Remover coluna auxiliar do histórico
+        df_historico = df_historico.drop(columns=["_chave_composta"])
+        # Concatenar novos registros
+        df_atualizado = pd.concat([df_historico, df_novos_registros], ignore_index=True)
+        salvar_base_historica(df_atualizado, nome_planilha)
+    else:
+        df_atualizado = df_historico.drop(columns=["_chave_composta"])
+
+    return df_atualizado, qtd_novos, len(df_atualizado)
+
+
+def ler_arquivo_upload(arquivo_upload):
+    """
+    Lê um arquivo CSV ou XLSX do st.file_uploader.
+    Aceita ambos os formatos.
+    """
+    nome = arquivo_upload.name.lower()
+
+    try:
+        if nome.endswith(".csv"):
+            try:
+                df = pd.read_csv(arquivo_upload, encoding="utf-8")
+            except UnicodeDecodeError:
+                arquivo_upload.seek(0)
+                df = pd.read_csv(arquivo_upload, encoding="latin-1")
+        elif nome.endswith((".xlsx", ".xls")):
+            df = pd.read_excel(arquivo_upload, engine="openpyxl")
+        else:
+            raise ValueError(f"Formato não suportado: {nome}. Use CSV ou XLSX.")
+
+        if df.empty:
+            raise ValueError("O arquivo está vazio.")
+
+        return df
+    except Exception as e:
+        raise Exception(f"Erro ao ler arquivo '{arquivo_upload.name}': {str(e)}")
+
+
+def ler_arquivo_rede(planilha_info):
+    """
+    Lê um arquivo Excel da rede interna.
+    Aplica filtros se definidos.
+    """
+    caminho = Path(planilha_info["caminho"]) / planilha_info["arquivo"]
+    aba = planilha_info.get("aba", 0)  # default: primeira aba
+    filtros = planilha_info.get("filtros", {})
+
+    if not caminho.exists():
+        raise FileNotFoundError(
+            f"Arquivo não encontrado na rede: {caminho}\n"
+            f"Verifique se você tem acesso ao caminho de rede."
+        )
+
+    try:
+        df = pd.read_excel(caminho, sheet_name=aba, engine="openpyxl")
+    except Exception as e:
+        raise Exception(f"Erro ao ler '{planilha_info['arquivo']}': {str(e)}")
+
+    if df.empty:
+        raise ValueError(f"O arquivo '{planilha_info['arquivo']}' está vazio.")
+
+    # Aplicar filtros
+    for coluna, valor in filtros.items():
+        if coluna in df.columns:
+            df = df[df[coluna] == valor].copy()
+        else:
+            raise ValueError(
+                f"Coluna de filtro '{coluna}' não encontrada em '{planilha_info['arquivo']}'.\n"
+                f"Colunas disponíveis: {list(df.columns)}"
+            )
+
+    if df.empty:
+        raise ValueError(
+            f"Após aplicar filtros, o arquivo '{planilha_info['arquivo']}' ficou vazio.\n"
+            f"Filtros aplicados: {filtros}"
+        )
+
+    return df
