@@ -11,9 +11,35 @@ BACKUP_DIR = BASE_DIR / "data" / "backups"
 RAW_DIR.mkdir(parents=True, exist_ok=True)
 BACKUP_DIR.mkdir(parents=True, exist_ok=True)
 
-# Credenciais e URLs (Substitua pelo ID real do Apps Script)
+# URL do WebApp (Google Apps Script) - Substitua pelo ID real
 WEBAPP_URL = "https://script.google.com/macros/s/SEU_ID_DO_APPS_SCRIPT/exec"
-GOOGLE_JSON_KEY = BASE_DIR / "credenciais.json"
 
-# Nomes das planilhas que o script deve procurar no Google Drive
-PLANILHAS_PARA_CONSOLIDAR = ["Base_Vendas", "Base_Estoque", "Base_Sistemas"]
+# ============================================================
+# PLANILHAS DO GOOGLE SHEETS (Via Export CSV - Sem Google Cloud)
+# ============================================================
+# Cada planilha é um dicionário com:
+#   - "nome": Nome amigável (aparece no log do Streamlit)
+#   - "spreadsheet_id": O ID da planilha (extraído da URL)
+#   - "gid": O ID da aba específica (extraído da URL após #gid=)
+#
+# Como encontrar:
+#   URL: https://docs.google.com/spreadsheets/d/SPREADSHEET_ID/edit#gid=GID
+# ============================================================
+
+PLANILHAS_GOOGLE = [
+    {
+        "nome": "RMA | Garantia e Arrependimento",
+        "spreadsheet_id": "1KTZTyHf_Lj3Sl6mA9trq38k5WgQJxBCRsoL7aP_itXI",
+        "gid": "2112567324",
+    },
+    {
+        "nome": "Cadastro Computadores (respostas)",
+        "spreadsheet_id": "10l1w3d3HYSKFgSsnjOZ545efR-bdIECEkOR82IjV3TE",
+        "gid": "150735617",
+    },
+    {
+        "nome": "Dash de Devolução - MOSPC",
+        "spreadsheet_id": "1m3tOvmSOJIvRZY9uZNf1idSTEnUFbHIWPNh5tiHkKe0",
+        "gid": "588129608",
+    },
+]
