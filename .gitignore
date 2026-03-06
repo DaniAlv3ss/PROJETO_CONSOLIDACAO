@@ -1,0 +1,15 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Data files (except .gitkeep placeholders)
+data/backups/*.json
+data/backups/*.csv
+data/raw/*.csv
+data/historico/*.csv
+
+# Environment
+.env
+venv/
+.venv/
